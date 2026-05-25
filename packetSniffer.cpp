@@ -20,8 +20,6 @@
 #define RESOL_Y 720
 #define AL_COLOR(c) al_map_rgb(c, c, c)
 
-//using namespace std;
-
 int link_hdr_length = 0;
 
 // Estructura para el vector
@@ -61,8 +59,11 @@ std::string obtener_protocolo(uint8_t prot_id) {
     }
 }
 
-void dibujado_pantalla(ALLEGRO_UTIL& recursos) {
+// --- MODIFICADO: Ahora recibe el std::vector con los paquetes capturados ---
+void dibujado_pantalla(ALLEGRO_UTIL& recursos, const std::vector<DatosPaquete>& paquetes) {
+    const int CANT_PAQUETES{ 8 };
     const float ESPACIADO_TXT{ 30 };
+
     ALLEGRO_COLOR color_barra_ident(al_map_rgb(170, 190, 240));
     al_clear_to_color(al_map_rgb(255, 255, 255));
 
@@ -80,7 +81,7 @@ void dibujado_pantalla(ALLEGRO_UTIL& recursos) {
         al_draw_filled_rectangle(20 + division, 175, 23 + division, 210, AL_COLOR(255));
 
         switch(i - 1) {
-        case NUM:       al_draw_text(recursos.fuente, AL_COLOR(0), ESPACIADO_TXT + division_txt, 180, 0, "No.");       break;
+        case NUM:       al_draw_text(recursos.fuente, AL_COLOR(0), ESPACIADO_TXT + division_txt, 180, 0, "ID");       break;
         case ORIGEN:    al_draw_text(recursos.fuente, AL_COLOR(0), ESPACIADO_TXT + division_txt, 180, 0, "Origen");       break;
         case DESTINO:   al_draw_text(recursos.fuente, AL_COLOR(0), ESPACIADO_TXT + division_txt, 180, 0, "Destino");       break;
         case PROTOCOLO: al_draw_text(recursos.fuente, AL_COLOR(0), ESPACIADO_TXT + division_txt, 180, 0, "Protocolo");       break;
@@ -89,16 +90,30 @@ void dibujado_pantalla(ALLEGRO_UTIL& recursos) {
         }
     }
     
-    //Debe existir una lista aquí para mostrar los datos
-    /*
-    for (int i{}; i < 1989; i++) {
-        // Está siendo escrita en terminal, no sé si querías que sólo hiciera el vector o lo imprimiera a pantalla con allegro
-        // Checa la línea 132
+    //----- DIBUJO DE LOS PAQUETES -----//
+    // Validación de seguridad para que no explote si hay menos de CANT_PAQUETES
+    int inicio = (paquetes.size() > CANT_PAQUETES) ? paquetes.size() - CANT_PAQUETES : 0;
+    
+    for (int i{ inicio }, k = 0; i < paquetes.size(); i++, k++) {
+        float espacio_vert = 220 + k * 40;
+
+        for (int j{ 1 }; j <= BARRA_IDENT_TAM; j++) {
+            float division_txt = (j - 1) * float(RESOL_X - 40) / BARRA_IDENT_TAM;
+
+            // Cambiar std::to_string en lugar de itoa por compatibilidad
+            switch (j - 1) {
+            case NUM:       al_draw_text(recursos.fuente, AL_COLOR(0), ESPACIADO_TXT + division_txt, espacio_vert, 0, std::to_string(paquetes[i].id).c_str());       break;
+            case ORIGEN:    al_draw_text(recursos.fuente, AL_COLOR(0), ESPACIADO_TXT + division_txt, espacio_vert, 0, paquetes[i].src_ip.c_str());       break;
+            case DESTINO:   al_draw_text(recursos.fuente, AL_COLOR(0), ESPACIADO_TXT + division_txt, espacio_vert, 0, paquetes[i].dst_ip.c_str());       break;
+            case PROTOCOLO: al_draw_text(recursos.fuente, AL_COLOR(0), ESPACIADO_TXT + division_txt, espacio_vert, 0, paquetes[i].protocolo.c_str());       break;
+            case TIEMPO:    al_draw_text(recursos.fuente, AL_COLOR(0), ESPACIADO_TXT + division_txt, espacio_vert, 0, std::to_string(paquetes[i].ttl).c_str());       break;
+            case INFO:      al_draw_text(recursos.fuente, AL_COLOR(0), ESPACIADO_TXT + division_txt, espacio_vert, 0, std::to_string(paquetes[i].len).c_str());       break;
+            }
+        }
     }
 
     al_draw_rectangle(15, 540, RESOL_X / 2 - 5, RESOL_Y - 15, AL_COLOR(128), 3);            //campo 2
     al_draw_rectangle(RESOL_X / 2 + 5, 540, RESOL_X - 15, RESOL_Y - 15, AL_COLOR(128), 3);  //Campo 3
-    */
 
     //----- Botones inter -----//
     al_draw_filled_circle(35, 70, 20, al_map_rgb(60, 100, 230));
@@ -114,7 +129,6 @@ void dibujado_pantalla(ALLEGRO_UTIL& recursos) {
 
 // Cambiado para que ahora reciba el vector y almacene los datos en memoria
 void call_me(u_char* user, const struct pcap_pkthdr* pkthdr, const u_char* packetd_ptr) {
-    // Convertir el puntero user de vuelta a tipo std::vector
     std::vector<DatosPaquete>* lista_paquetes = (std::vector<DatosPaquete>*)user;
 
     packetd_ptr += link_hdr_length;
@@ -128,7 +142,7 @@ void call_me(u_char* user, const struct pcap_pkthdr* pkthdr, const u_char* packe
     p.tos = ip_hdr->ip_tos;
     p.len = ntohs(ip_hdr->ip_len);
     p.hlen = ip_hdr->ip_hl;
-    p.protocolo = obtener_protocolo(ip_hdr->ip_p); // Captutar el protocolo
+    p.protocolo = obtener_protocolo(ip_hdr->ip_p); // Capturar el protocolo
 
     // Imprimir en consola
     printf("ID: %d | SRC: %s | DST: %s | PROTO: %s | TTL: %d\n", 
@@ -174,7 +188,7 @@ int main(int argc, char const* argv[]) {
 
     iniciar_recursos(recursos);
 
-    // CONFIGURACIÓN DE PCAP (lo moví, antes estaba después del bucle de la pantalla)
+    // CONFIGURACIÓN DE PCAP
     const char* device = "enp0s3";
     char error_buffer[PCAP_ERRBUF_SIZE];
     
@@ -201,31 +215,33 @@ int main(int argc, char const* argv[]) {
 
     // Bucle con captura e interfaz
     while (programa_corriendo) {
-        al_wait_for_event(cola_eventos, &eventos);
+        if (capturando) {
+            pcap_dispatch(capdev, -1, call_me, (u_char*)&vector_paquetes);
+        }
 
-        switch (eventos.type) {
-        case ALLEGRO_EVENT_TIMER:
-            // Cada 1/60 de segundo revisa si hay paquetes disponibles
-            if (capturando) {
-                // pcap_dispatch procesa todos los paquetes en cola en ese momento sin bloquear
-                pcap_dispatch(capdev, -1, call_me, (u_char*)&vector_paquetes);
-            }
-            dibujado_pantalla(recursos);
-            break;
+        if (!al_event_queue_is_empty(cola_eventos)){
+            al_wait_for_event(cola_eventos, &eventos);
 
-        case ALLEGRO_EVENT_KEY_DOWN:
-            if (eventos.keyboard.keycode == ALLEGRO_KEY_P) {
-                capturando = !capturando; // Alternar estado
-                printf(capturando ? "\n=== CAPTURA REANUDADA ===\n" : "\n=== CAPTURA PAUSADA ===\n");
-            }
-            else if (eventos.keyboard.keycode == ALLEGRO_KEY_X) {
-                programa_corriendo = false; // Rompe el bucle para guardar y salir
-            }
-            break;
+            switch (eventos.type) {
+            case ALLEGRO_EVENT_TIMER:
+                // }Mandar el vector para dibujarlo
+                dibujado_pantalla(recursos, vector_paquetes);
+                break;
 
-        case ALLEGRO_EVENT_DISPLAY_CLOSE:
-            programa_corriendo = false;
-            break;
+            case ALLEGRO_EVENT_KEY_DOWN:
+                if (eventos.keyboard.keycode == ALLEGRO_KEY_P) {
+                    capturando = !capturando;
+                    printf(capturando ? "\n=== CAPTURA REANUDADA ===\n" : "\n=== CAPTURA PAUSADA ===\n");
+                }
+                else if (eventos.keyboard.keycode == ALLEGRO_KEY_X) {
+                    programa_corriendo = false;
+                }
+                break;
+
+            case ALLEGRO_EVENT_DISPLAY_CLOSE:
+                programa_corriendo = false;
+                break;
+            }
         }
     }
 
@@ -247,7 +263,6 @@ int main(int argc, char const* argv[]) {
         printf("ERR: No se pudo crear el archivo CSV\n");
     }
 
-    // Cerrar todo (no supe si ponerlo en tu función de iniciar/descargar)
     pcap_close(capdev);
     al_destroy_display(display);
     al_destroy_timer(tiempo);
