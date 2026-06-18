@@ -41,7 +41,7 @@ void PacketCallback(u_char* user, const struct pcap_pkthdr* pkthdr, const u_char
     pkt.id = g_packet_id_counter++;
     pkt.length = pkthdr->len;
 
-    // Obtener Marca de Tiempo (Timestamp o Time)
+    // Obtener Marca de Tiempo (Timestamp o Time), MODIFICAR
     time_t rawtime = pkthdr->ts.tv_sec;
     struct tm* timeinfo = localtime(&rawtime);
     char time_str[32];
@@ -81,30 +81,146 @@ void PacketCallback(u_char* user, const struct pcap_pkthdr* pkthdr, const u_char
         size_t ip_header_len = ip->ihl * 4;
         const u_char* payload = packet + sizeof(struct ether_header) + ip_header_len;
 
-        // Decodificar Capa de Transporte sobre IPv4
+        // Decodificar Capa de Transporte / Protocolo sobre IPv4, MODIFICAR POR SWITCH?
         if (ip->protocol == IPPROTO_TCP) {
             pkt.protocol = "TCP";
             struct tcphdr* tcp = (struct tcphdr*)payload;
             pkt.src_port = ntohs(tcp->source);
             pkt.dst_port = ntohs(tcp->dest);
             pkt.info = "Puerto Origen: " + std::to_string(pkt.src_port) + " -> Puerto Destino: " + std::to_string(pkt.dst_port);
-        } 
+        }
         else if (ip->protocol == IPPROTO_UDP) {
             pkt.protocol = "UDP";
             struct udphdr* udp = (struct udphdr*)payload;
             pkt.src_port = ntohs(udp->source);
             pkt.dst_port = ntohs(udp->dest);
             pkt.info = "Puerto Origen: " + std::to_string(pkt.src_port) + " -> Puerto Destino: " + std::to_string(pkt.dst_port);
-        } 
+        }
         else if (ip->protocol == IPPROTO_ICMP) {
             pkt.protocol = "ICMP";
             struct icmphdr* icmp = (struct icmphdr*)payload;
             pkt.src_port = 0; pkt.dst_port = 0;
             pkt.info = "Tipo ICMP: " + std::to_string(icmp->type) + " Codigo: " + std::to_string(icmp->code);
-        } 
+        }
+        else if (ip->protocol == 2) {   // IGMP
+            pkt.protocol = "IGMP";
+            pkt.src_port = 0; pkt.dst_port = 0;
+            uint8_t igmp_type = payload[0];
+            if      (igmp_type == 0x11) pkt.info = "Membership Query";
+            else if (igmp_type == 0x16) pkt.info = "Membership Report v2";
+            else if (igmp_type == 0x22) pkt.info = "Membership Report v3";
+            else if (igmp_type == 0x17) pkt.info = "Leave Group";
+            else pkt.info = "Tipo IGMP: 0x" + std::to_string(igmp_type);
+        }
+        else if (ip->protocol == 4) {   // IP-in-IP tunnel
+            pkt.protocol = "IPIP";
+            pkt.src_port = 0; pkt.dst_port = 0;
+            pkt.info = "Tunel IP-in-IP encapsulado";
+        }
+        else if (ip->protocol == 47) {  // GRE
+            pkt.protocol = "GRE";
+            pkt.src_port = 0; pkt.dst_port = 0;
+            uint16_t gre_flags = ntohs(*(uint16_t*)payload);
+            pkt.info = "Generic Routing Encapsulation (flags: 0x" + 
+                       [](uint16_t v){ char b[8]; snprintf(b,sizeof(b),"%04X",v); return std::string(b); }(gre_flags) + ")";
+        }
+        else if (ip->protocol == 50) {  // ESP - IPSec
+            pkt.protocol = "ESP";
+            pkt.src_port = 0; pkt.dst_port = 0;
+            uint32_t spi = ntohl(*(uint32_t*)payload);
+            char spi_str[16]; snprintf(spi_str, sizeof(spi_str), "0x%08X", spi);
+            pkt.info = "IPSec ESP - SPI: " + std::string(spi_str) + " (datos cifrados)";
+        }
+        else if (ip->protocol == 51) {  // AH - IPSec
+            pkt.protocol = "AH";
+            pkt.src_port = 0; pkt.dst_port = 0;
+            uint32_t spi = ntohl(*(uint32_t*)(payload + 4));
+            char spi_str[16]; snprintf(spi_str, sizeof(spi_str), "0x%08X", spi);
+            pkt.info = "IPSec AH - SPI: " + std::string(spi_str);
+        }
+        else if (ip->protocol == 88) {  // EIGRP (Cisco)
+            pkt.protocol = "EIGRP";
+            pkt.src_port = 0; pkt.dst_port = 0;
+            uint8_t opcode = payload[1];
+            if      (opcode == 1) pkt.info = "EIGRP Update";
+            else if (opcode == 3) pkt.info = "EIGRP Query";
+            else if (opcode == 4) pkt.info = "EIGRP Reply";
+            else if (opcode == 5) pkt.info = "EIGRP Hello";
+            else pkt.info = "EIGRP Opcode: " + std::to_string(opcode);
+        }
+        else if (ip->protocol == 89) {  // OSPF
+            pkt.protocol = "OSPF";
+            pkt.src_port = 0; pkt.dst_port = 0;
+            uint8_t ospf_type = payload[1];
+            if      (ospf_type == 1) pkt.info = "OSPF Hello";
+            else if (ospf_type == 2) pkt.info = "OSPF Database Description (DBD)";
+            else if (ospf_type == 3) pkt.info = "OSPF Link State Request (LSR)";
+            else if (ospf_type == 4) pkt.info = "OSPF Link State Update (LSU)";
+            else if (ospf_type == 5) pkt.info = "OSPF Link State Ack (LSAck)";
+            else pkt.info = "OSPF Tipo: " + std::to_string(ospf_type);
+        }
+        else if (ip->protocol == 103) { // PIM
+            pkt.protocol = "PIM";
+            pkt.src_port = 0; pkt.dst_port = 0;
+            uint8_t pim_type = payload[1] & 0x0F;
+            if      (pim_type == 0) pkt.info = "PIM Hello";
+            else if (pim_type == 1) pkt.info = "PIM Register";
+            else if (pim_type == 3) pkt.info = "PIM Join/Prune";
+            else if (pim_type == 4) pkt.info = "PIM Bootstrap";
+            else pkt.info = "PIM Tipo: " + std::to_string(pim_type);
+        }
+        else if (ip->protocol == 112) { // VRRP
+            pkt.protocol = "VRRP";
+            pkt.src_port = 0; pkt.dst_port = 0;
+            uint8_t vrid = payload[1];
+            uint8_t priority = payload[2];
+            pkt.info = "VRRP Advertisement - VRID: " + std::to_string(vrid) + " Prioridad: " + std::to_string(priority);
+        }
+        else if (ip->protocol == 115) { // L2TP
+            pkt.protocol = "L2TP";
+            pkt.src_port = 0; pkt.dst_port = 0;
+            pkt.info = "Layer 2 Tunneling Protocol";
+        }
+        else if (ip->protocol == 132) { // SCTP
+            pkt.protocol = "SCTP";
+            pkt.src_port  = ntohs(*(uint16_t*)payload);
+            pkt.dst_port  = ntohs(*(uint16_t*)(payload + 2));
+            pkt.info = "Puerto Origen: " + std::to_string(pkt.src_port) + " -> Puerto Destino: " + std::to_string(pkt.dst_port);
+        }
+        else if (ip->protocol == 46) {  // RSVP
+            pkt.protocol = "RSVP";
+            pkt.src_port = 0; pkt.dst_port = 0;
+            uint8_t msg_type = payload[1];
+            if      (msg_type == 1) pkt.info = "RSVP Path";
+            else if (msg_type == 2) pkt.info = "RSVP Resv";
+            else if (msg_type == 3) pkt.info = "RSVP PathErr";
+            else pkt.info = "RSVP Tipo: " + std::to_string(msg_type);
+        }
+        else if (ip->protocol == 41) {  // IPv6 encapsulado en IPv4
+            pkt.protocol = "IPv6";
+            pkt.src_port = 0; pkt.dst_port = 0;
+            pkt.info = "IPv6 encapsulado en IPv4 (6in4 tunnel)";
+        }
         else {
-            pkt.protocol = "Otros (IPv4)";
-            pkt.info = "Protocolo IP nativo: " + std::to_string(ip->protocol);
+            // Cualquier otro protocolo: mostrar nombre si es conocido por IANA
+            pkt.src_port = 0; pkt.dst_port = 0;
+            const char* nombre = nullptr;
+            switch (ip->protocol) {
+                case   8: nombre = "EGP";     break;
+                case   9: nombre = "IGRP";    break;
+                case  58: nombre = "ICMPv6";  break;
+                case  97: nombre = "ETHERIP"; break;
+                case 108: nombre = "IPComp";  break;
+                case 137: nombre = "MPLS";    break;
+                case 139: nombre = "HIP";     break;
+            }
+            if (nombre) {
+                pkt.protocol = std::string(nombre);
+                pkt.info = std::string(nombre) + " (proto " + std::to_string(ip->protocol) + ")";
+            } else {
+                pkt.protocol = "IPv4/" + std::to_string(ip->protocol);
+                pkt.info = "Protocolo IPv4 no decodificado: " + std::to_string(ip->protocol);
+            }
         }
     } 
     else if (pkt.eth_type == 0x0806) { // TRÁFICO ARP (Address Resolution Protocol)
