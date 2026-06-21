@@ -18,6 +18,14 @@ using namespace std;
 
 int g_selected_packet_idx = -1;
 
+// --- Sistema de confirmaciones (avisos modales) ---
+// Tipo de acción pendiente que lanzó la confirmación. NINGUNA = no hay modal abierto.
+enum class AccionPendiente { NINGUNA, CAMBIAR_INTERFAZ, LIMPIAR, SALIR };
+AccionPendiente g_accion_pendiente = AccionPendiente::NINGUNA;
+int g_interfaz_destino_idx = -1;          // Índice de la interfaz a la que se quiere cambiar (caso CAMBIAR_INTERFAZ)
+bool g_solicitud_cierre_ventana = false;  // true cuando GLFW pidió cerrar y estamos confirmando con el usuario
+bool g_abrir_popup_confirmacion = false;  // Bandera para abrir el popup en el siguiente frame (evita ID stack issues)
+
 // Variables de Filtrado
 char filter_src_ip[64] = "";
 char filter_dst_ip[64] = "";
@@ -55,7 +63,7 @@ ImVec4 AplicarTono(const ImVec4& base_claro) {
     return ImVec4(base_claro.x * factor, base_claro.y * factor, base_claro.z * factor, base_claro.w);
 }
 
-// ── Paleta fija de 10 colores pastel seleccionables por el usuario ─────
+// Paleta fija de 10 colores pastel
 const int NUM_PALETA = 10;
 const char* g_paleta_nombres[NUM_PALETA] = {
     "Lavanda", "Azul cielo", "Verde menta", "Amarillo", "Lila",
@@ -231,11 +239,33 @@ int main(int, char**) {
     int interfaz_seleccionada_idx = 0;
 
     // Bucle de la ventana
-    while (!glfwWindowShouldClose(window)) {
+    bool g_debe_cerrar_app = false; // Controla la salida real del bucle (separado del flag nativo de GLFW)
+    while (!g_debe_cerrar_app) {
         int ancho_ventana, alto_ventana;
 
         //Obtiene eventos de GLFW y genera un nuevo frame
         glfwPollEvents();
+
+        // Si el usuario pidió cerrar (botón X / Alt+F4), se intercepta para cancelar el cierre nativo y si hay datos
+        // sin guardar o captura activa, mostrar el modal de confirmación en su lugar
+        if (glfwWindowShouldClose(window)) {
+            glfwSetWindowShouldClose(window, GLFW_FALSE); // Cancela el cierre automático de GLFW
+            if (g_accion_pendiente == AccionPendiente::NINGUNA) {
+                bool hay_datos;
+                {
+                    std::lock_guard<std::mutex> lk(g_packets_mutex);
+                    hay_datos = !g_packets.empty();
+                }
+                if (g_is_capturing || hay_datos) {
+                    g_accion_pendiente = AccionPendiente::SALIR;
+                    g_abrir_popup_confirmacion = true;
+                } else {
+                    g_debe_cerrar_app = true; // Nada que perder, cerrar directo
+                    continue;
+                }
+            }
+        }
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -283,8 +313,23 @@ int main(int, char**) {
         if (ImGui::BeginCombo("##iface", combo_preview.c_str())) {
             for (int n = 0; n < (int)interfaces.size(); n++) {
                 const bool is_sel = (interfaz_seleccionada_idx == n);
-                if (ImGui::Selectable(interfaces[n].c_str(), is_sel))
-                    interfaz_seleccionada_idx = n;
+                if (ImGui::Selectable(interfaces[n].c_str(), is_sel)) {
+                    if (n != interfaz_seleccionada_idx) {
+                        bool hay_datos;
+                        {
+                            std::lock_guard<std::mutex> lk(g_packets_mutex);
+                            hay_datos = !g_packets.empty();
+                        }
+                        if (g_is_capturing || hay_datos) {
+                            // Hay captura activa o paquetes sin exportar: pedir confirmación antes de cambiar
+                            g_interfaz_destino_idx = n;
+                            g_accion_pendiente = AccionPendiente::CAMBIAR_INTERFAZ;
+                            g_abrir_popup_confirmacion = true;
+                        } else {
+                            interfaz_seleccionada_idx = n;
+                        }
+                    }
+                }
                 if (is_sel) ImGui::SetItemDefaultFocus();
             }
             ImGui::EndCombo();
@@ -333,7 +378,7 @@ int main(int, char**) {
         }
         ImGui::SameLine(0, 14);
 
-        // Contador de paquetes capturados (info en tiempo real)
+        // Contador de paquetes capturados (info en tiempo real, modificar)
         {
             std::lock_guard<std::mutex> lk(g_packets_mutex);
             int total = (int)g_packets.size();
@@ -391,10 +436,10 @@ int main(int, char**) {
                 // Pestaña 1: Opciones generales
                 if (ImGui::BeginTabItem("General")) {
                     ImGui::Spacing();
-                    ImGui::Text("Zoom (Areas 1, 2 y 3)");
+                    ImGui::Text("Zoom global");
                     ImGui::SameLine(150);
 
-                    // Votones +, - y restablecer
+                    // Botones +, - y restablecer
                     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.26f, 0.26f, 0.30f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.34f, 0.34f, 0.40f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.20f, 0.20f, 0.24f, 1.0f));
@@ -516,10 +561,16 @@ int main(int, char**) {
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.46f, 0.36f, 0.10f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.20f, 0.16f, 0.06f, 1.0f));
         if (ImGui::Button("Limpiar", ImVec2(80, 26))) {
-            std::lock_guard<std::mutex> lock(g_packets_mutex);
-            g_packets.clear();
-            g_selected_packet_idx = -1;
-            g_packet_id_counter = 1;
+            bool hay_datos;
+            {
+                std::lock_guard<std::mutex> lk(g_packets_mutex);
+                hay_datos = !g_packets.empty();
+            }
+            if (hay_datos) {
+                g_accion_pendiente = AccionPendiente::LIMPIAR;
+                g_abrir_popup_confirmacion = true;
+            }
+            // Si ya está vacío, no hay nada que confirmar ni que limpiar
         }
         ImGui::PopStyleColor(3);
 
@@ -587,29 +638,44 @@ int main(int, char**) {
         // Variable local para rastrear si el usuario estaba al fondo antes de procesar las filas
         bool estaba_al_fondo = false;
 
-        // Contenedor propio con scroll para que el zoom (SetWindowFontScale) sí afecte a la tabla
-        // (BeginTable con ScrollY crea su propia ventana interna que ignora el scale del padre)
-        ImGui::BeginChild("Area1Container", ImVec2(0, g_area1_height), true,
-                           ImGuiWindowFlags_HorizontalScrollbar);
+        // Contenedor propio que define la altura del panel (redimensionable con el splitter).
+        // El scroll vertical real lo maneja la TABLA internamente (ImGuiTableFlags_ScrollY),
+        // porque es la única forma en ImGui de tener un encabezado "pegado" (sticky) al hacer scroll.
+        ImGui::BeginChild("Area1Container", ImVec2(0, g_area1_height), true, ImGuiWindowFlags_NoScrollbar);
         ImGui::SetWindowFontScale(g_zoom_nivel);
 
-        // Verificar la posición del scroll vertical del contenedor antes de iterar
-        float scroll_y = ImGui::GetScrollY();
-        float max_scroll_y = ImGui::GetScrollMaxY();
-        // Si el scroll está al final o muy cerca de él (5px), activar autoscroll
-        if (scroll_y >= max_scroll_y - 5.0f) {
-            estaba_al_fondo = true;
-        }
+        if (ImGui::BeginTable("Trafico de la Red", 7,
+                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                ImGuiTableFlags_Reorderable |   // Permite arrastrar columnas para reordenarlas
+                ImGuiTableFlags_Resizable   |   // Permite ajustar el ancho de cada columna
+                ImGuiTableFlags_ScrollY     |   // Habilita región interna con scroll + encabezado fijo (sticky header)
+                ImGuiTableFlags_SizingFixedFit,
+                ImVec2(0, ImGui::GetContentRegionAvail().y))) {
+            // La tabla con ScrollY crea su propia ventana interna de scroll, que NO hereda
+            // el SetWindowFontScale del child padre (Area1Container). Por eso se aplica también aquí.
+            ImGui::SetWindowFontScale(g_zoom_nivel);
 
-        if (ImGui::BeginTable("Trafico de la Red", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg, ImVec2(0, 0))) {
-            ImGui::TableSetupColumn("No.", ImGuiTableColumnFlags_WidthFixed, 50.0f);
-            ImGui::TableSetupColumn("Tiempo", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-            ImGui::TableSetupColumn("IP Origen", ImGuiTableColumnFlags_WidthFixed, 130.0f);
-            ImGui::TableSetupColumn("IP Destino", ImGuiTableColumnFlags_WidthFixed, 130.0f);
-            ImGui::TableSetupColumn("Protocolo", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-            ImGui::TableSetupColumn("Longitud", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-            ImGui::TableSetupColumn("Informacion", ImGuiTableColumnFlags_WidthStretch);
+            // NoHide impide que el usuario oculte/colapse por completo una columna desde el menú del header.
+            // El segundo parámetro de WidthFixed es el ancho INICIAL; ImGuiTableColumnFlags_WidthFixed
+            // respeta un ancho mínimo interno de ImGui (~ItemSpacing) al redimensionar, así nunca llega a 0.
+            // "Informacion" usa WidthStretch para ocupar todo el espacio sobrante hacia la derecha.
+            ImGui::TableSetupColumn("No.",         ImGuiTableColumnFlags_WidthFixed   | ImGuiTableColumnFlags_NoHide, 50.0f);
+            ImGui::TableSetupColumn("Tiempo",      ImGuiTableColumnFlags_WidthFixed   | ImGuiTableColumnFlags_NoHide, 80.0f);
+            ImGui::TableSetupColumn("IP Origen",   ImGuiTableColumnFlags_WidthFixed   | ImGuiTableColumnFlags_NoHide, 130.0f);
+            ImGui::TableSetupColumn("IP Destino",  ImGuiTableColumnFlags_WidthFixed   | ImGuiTableColumnFlags_NoHide, 130.0f);
+            ImGui::TableSetupColumn("Protocolo",   ImGuiTableColumnFlags_WidthFixed   | ImGuiTableColumnFlags_NoHide, 80.0f);
+            ImGui::TableSetupColumn("Longitud",    ImGuiTableColumnFlags_WidthFixed   | ImGuiTableColumnFlags_NoHide, 70.0f);
+            ImGui::TableSetupColumn("Informacion", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoHide, 280.0f);
+            ImGui::TableSetupScrollFreeze(0, 1); // Congela la fila de encabezados (siempre visible al hacer scroll)
             ImGui::TableHeadersRow();
+
+            // Verificar la posición del scroll vertical DE LA TABLA antes de iterar
+            // (con ScrollY activo, el scroll vive en la región interna de la tabla, no en el child)
+            float scroll_y = ImGui::GetScrollY();
+            float max_scroll_y = ImGui::GetScrollMaxY();
+            if (scroll_y >= max_scroll_y - 5.0f) {
+                estaba_al_fondo = true;
+            }
 
             // Exclusión mutua para leer los paquetes capturados de forma segura
             g_packets_mutex.lock();
@@ -662,13 +728,14 @@ int main(int, char**) {
                 }
             }
             g_packets_mutex.unlock();
-            ImGui::EndTable();
-        }
 
-        // Ejecución del autoscroll sobre el contenedor (Area1Container)
-        // Si el programa está capturando y el usuario no ha subido manualmente, se forza la vista al fondo
-        if (g_is_capturing && estaba_al_fondo) {
-            ImGui::SetScrollHereY(1.0f);
+            // Ejecución del autoscroll DENTRO de la región de la tabla (es donde vive el scroll real)
+            // Si el programa está capturando y el usuario no ha subido manualmente, se forza la vista al fondo
+            if (g_is_capturing && estaba_al_fondo) {
+                ImGui::SetScrollHereY(1.0f);
+            }
+
+            ImGui::EndTable();
         }
 
         ImGui::EndChild();
@@ -695,7 +762,7 @@ int main(int, char**) {
         ImGui::Columns(2, "LowerPanels", true);
 
         // ----- Datos por capas -----
-        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.10f, 1.0f), "▸ Análisis por Capas  ");
+        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.10f, 1.0f), "Análisis por Capas  ");
         ImGui::SameLine();
         ImGui::TextDisabled("OSI / TCP-IP");
         ImGui::BeginChild("TreePanel", ImVec2(0, lower_height), true, ImGuiWindowFlags_HorizontalScrollbar);
@@ -853,6 +920,144 @@ int main(int, char**) {
         
         ImGui::EndChild();
         ImGui::Columns(1);
+
+        // --- Popup modal de confirmación (Cambiar interfaz / Limpiar / Salir) ---
+        if (g_abrir_popup_confirmacion) {
+            ImGui::OpenPopup("##ModalConfirmacion");
+            g_abrir_popup_confirmacion = false;
+        }
+
+        // Centrar el modal en la pantalla
+        ImGui::SetNextWindowPos(ImVec2(ancho_ventana * 0.5f, alto_ventana * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(460, 0));
+
+        if (ImGui::BeginPopupModal("##ModalConfirmacion", nullptr,
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
+
+            // Conteo de paquetes para mostrar en el mensaje
+            int total_paquetes;
+            {
+                std::lock_guard<std::mutex> lk(g_packets_mutex);
+                total_paquetes = (int)g_packets.size();
+            }
+
+            // --- Encabezado e ícono según el tipo de acción ---
+            const char* titulo = "";
+            std::string mensaje;
+            switch (g_accion_pendiente) {
+                case AccionPendiente::CAMBIAR_INTERFAZ:
+                    titulo = "Cambiar interfaz de red";
+                    mensaje = "Tienes " + std::to_string(total_paquetes) + " paquete(s) capturado(s) en el Area 1.\n"
+                               "Cambiar de interfaz detendra la captura actual y, si continuas,\n"
+                               "se perdera el registro actual a menos que lo exportes primero.";
+                    break;
+                case AccionPendiente::LIMPIAR:
+                    titulo = "Limpiar registro de trafico";
+                    mensaje = "Estas a punto de borrar " + std::to_string(total_paquetes) + " paquete(s)\n"
+                               "del Area 1. Esta accion no se puede deshacer.";
+                    break;
+                case AccionPendiente::SALIR:
+                    titulo = "Salir del Packet Sniffeador";
+                    mensaje = "Tienes " + std::to_string(total_paquetes) + " paquete(s) capturado(s) sin exportar"
+                               + std::string(g_is_capturing ? " y una captura en curso.\n" : ".\n")
+                               + "Si sales ahora, esta informacion se perdera.";
+                    break;
+                default: break;
+            }
+
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s", titulo);
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextWrapped("%s", mensaje.c_str());
+            ImGui::Spacing();
+            ImGui::Spacing();
+
+            float ancho_boton = 132.0f;
+
+            // Botón Cancelar (siempre disponible, no hace nada)
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.30f, 0.30f, 0.34f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.40f, 0.40f, 0.46f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.22f, 0.22f, 0.26f, 1.0f));
+            if (ImGui::Button("Cancelar", ImVec2(ancho_boton, 30))) {
+                g_accion_pendiente = AccionPendiente::NINGUNA;
+                g_interfaz_destino_idx = -1;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopStyleColor(3);
+
+            ImGui::SameLine();
+
+            // Botón Guardar (exporta a CSV y luego ejecuta la acción)
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.18f, 0.32f, 0.58f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.42f, 0.75f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.13f, 0.24f, 0.44f, 1.0f));
+            const char* texto_guardar = (g_accion_pendiente == AccionPendiente::LIMPIAR) ? "Guardar y limpiar" : "Guardar y continuar";
+            if (ImGui::Button(texto_guardar, ImVec2(ancho_boton, 30))) {
+                exportar_csv();
+
+                if (g_accion_pendiente == AccionPendiente::CAMBIAR_INTERFAZ) {
+                    if (g_is_capturing) DetenerCaptura();
+                    std::lock_guard<std::mutex> lock(g_packets_mutex);
+                    g_packets.clear();
+                    g_selected_packet_idx = -1;
+                    g_packet_id_counter = 1;
+                    interfaz_seleccionada_idx = g_interfaz_destino_idx;
+                }
+                else if (g_accion_pendiente == AccionPendiente::LIMPIAR) {
+                    std::lock_guard<std::mutex> lock(g_packets_mutex);
+                    g_packets.clear();
+                    g_selected_packet_idx = -1;
+                    g_packet_id_counter = 1;
+                }
+                else if (g_accion_pendiente == AccionPendiente::SALIR) {
+                    g_debe_cerrar_app = true;
+                }
+
+                g_accion_pendiente = AccionPendiente::NINGUNA;
+                g_interfaz_destino_idx = -1;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopStyleColor(3);
+
+            // Botón "continuar sin guardar"
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.68f, 0.14f, 0.14f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.84f, 0.18f, 0.18f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.50f, 0.10f, 0.10f, 1.0f));
+
+            const char* texto_sin_guardar = "Sin guardar";
+            if (g_accion_pendiente == AccionPendiente::CAMBIAR_INTERFAZ) texto_sin_guardar = "Cambiar sin guardar";
+            else if (g_accion_pendiente == AccionPendiente::LIMPIAR)     texto_sin_guardar = "Limpiar sin guardar";
+            else if (g_accion_pendiente == AccionPendiente::SALIR)       texto_sin_guardar = "Salir sin guardar";
+
+            if (ImGui::Button(texto_sin_guardar, ImVec2(ancho_boton, 30))) {
+                if (g_accion_pendiente == AccionPendiente::CAMBIAR_INTERFAZ) {
+                    if (g_is_capturing) DetenerCaptura();
+                    std::lock_guard<std::mutex> lock(g_packets_mutex);
+                    g_packets.clear();
+                    g_selected_packet_idx = -1;
+                    g_packet_id_counter = 1;
+                    interfaz_seleccionada_idx = g_interfaz_destino_idx;
+                }
+                else if (g_accion_pendiente == AccionPendiente::LIMPIAR) {
+                    std::lock_guard<std::mutex> lock(g_packets_mutex);
+                    g_packets.clear();
+                    g_selected_packet_idx = -1;
+                    g_packet_id_counter = 1;
+                }
+                else if (g_accion_pendiente == AccionPendiente::SALIR) {
+                    g_debe_cerrar_app = true;
+                }
+
+                g_accion_pendiente = AccionPendiente::NINGUNA;
+                g_interfaz_destino_idx = -1;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopStyleColor(3);
+
+            ImGui::EndPopup();
+        }
+
         ImGui::End();
 
         //Dibujar a pantalla
