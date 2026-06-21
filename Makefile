@@ -20,7 +20,7 @@ IMGUI_SOURCES = $(IMGUI_DIR)/imgui.cpp \
                 $(IMGUI_DIR)/imgui_impl_opengl3.cpp
 
 # Los archivos fuente del proyecto
-SRC_SOURCES = ./src/main.cpp
+SRC_SOURCES = ./src/main.cpp ./src/sniffer.cpp
 
 # Unión de todas las fuentes y generación de archivos objeto (.o)
 SOURCES = $(SRC_SOURCES) $(IMGUI_SOURCES)
