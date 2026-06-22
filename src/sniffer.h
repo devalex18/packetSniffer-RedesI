@@ -7,6 +7,7 @@
 #include <mutex>
 #include <atomic>
 #include <pcap.h>
+#include <sys/time.h>
 
 #define ETHERTYPE_IP 0x0800
 
@@ -29,6 +30,16 @@ struct PacketData {
     uint16_t src_port;
     uint16_t dst_port;
 
+    // Protocolo de aplicación detectado por puerto (SSH, HTTP, DNS…); vacío si no se reconoce
+    std::string app_protocol;
+
+    // Flags TCP: SYN, ACK, FIN, RST, PSH, URG (bitmask sobre los 6 bits bajos)
+    uint8_t tcp_flags = 0;
+
+    // Versión IP del paquete (4 o 6) y longitud total del datagrama IP
+    uint8_t  ip_version = 0;
+    uint16_t ip_len     = 0;
+
     // Contenido RAW (Área 3)
     std::vector<uint8_t> raw_bytes;
 };
@@ -38,6 +49,9 @@ extern std::vector<PacketData> g_packets;
 extern std::mutex g_packets_mutex;        // Protege el vector al insertar desde el hilo
 extern std::atomic<bool> g_is_capturing;  // Control seguro del estado del hilo
 extern int g_packet_id_counter;           // Contador incremental de paquetes
+
+// Timestamp del primer paquete de la sesión actual
+extern struct timeval g_capture_start_time;
 
 // Funciones del módulo de red
 bool IniciarHiloCaptura(const std::string& interfaz);

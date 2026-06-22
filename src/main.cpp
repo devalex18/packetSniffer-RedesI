@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <sstream>
 #include <fstream>
+#include <algorithm>
 #include <GLFW/glfw3.h>
 
 #include "imgui.h"
@@ -18,13 +19,12 @@ using namespace std;
 
 int g_selected_packet_idx = -1;
 
-// --- Sistema de confirmaciones (avisos modales) ---
-// Tipo de acción pendiente que lanzó la confirmación. NINGUNA = no hay modal abierto.
+// Tipo de acción pendiente que lanzó la confirmación, NINGUNA = no hay modal abierto
 enum class AccionPendiente { NINGUNA, CAMBIAR_INTERFAZ, LIMPIAR, SALIR };
 AccionPendiente g_accion_pendiente = AccionPendiente::NINGUNA;
 int g_interfaz_destino_idx = -1;          // Índice de la interfaz a la que se quiere cambiar (caso CAMBIAR_INTERFAZ)
 bool g_solicitud_cierre_ventana = false;  // true cuando GLFW pidió cerrar y estamos confirmando con el usuario
-bool g_abrir_popup_confirmacion = false;  // Bandera para abrir el popup en el siguiente frame (evita ID stack issues)
+bool g_abrir_popup_confirmacion = false;  // Bandera para abrir el popup en el siguiente frame y evitar erroes por capas (ImGUI)
 
 // Variables de Filtrado
 char filter_src_ip[64] = "";
@@ -32,16 +32,21 @@ char filter_dst_ip[64] = "";
 char filter_src_port[16] = "";
 char filter_dst_port[16] = "";
 char filter_protocol[32] = "";
+char filter_payload[128] = "";
+bool g_show_dpi_search = false;
 
 // Variable global para controlar la altura dinámica del área de captura de paquetes mediante el Splitter
 float g_area1_height = -1.0f; 
 
-// --- Configuración visual global ---
 // Zoom global aplicado a las Áreas 1, 2 y 3 (tabla de tráfico, capas OSI, hexdump)
 float g_zoom_nivel = 1.0f;
 const float ZOOM_MIN  = 0.70f;
 const float ZOOM_MAX  = 2.00f;
 const float ZOOM_PASO = 0.10f;
+
+// Activa/desactiva el coloreado por protocolo en el Área 1
+bool g_color_protocolo_activo = true;
+int  g_text_color_idx_previo  = 0;   // Guarda el color de letra antes de desactivar colores
 
 // Tono de los colores pastel de fondo: 0=Claro 1=Medio 2=Oscuro, MODIFICAR
 int g_table_bg_tone_idx = 0;
@@ -63,7 +68,7 @@ ImVec4 AplicarTono(const ImVec4& base_claro) {
     return ImVec4(base_claro.x * factor, base_claro.y * factor, base_claro.z * factor, base_claro.w);
 }
 
-// Paleta fija de 10 colores pastel
+// Paleta fija de 10 colores pastel seleccionables
 const int NUM_PALETA = 10;
 const char* g_paleta_nombres[NUM_PALETA] = {
     "Lavanda", "Azul cielo", "Verde menta", "Amarillo", "Lila",
@@ -103,17 +108,72 @@ ProtocoloColor g_protocolo_colores[] = {
     { "L2TP",   4 }, // Lila
     { "RSVP",   2 }, // Verde menta
     { "IPIP",   1 }, // Azul cielo
+    // Protocolos detectados por puerto
+    { "SSH",        0 }, // Lavanda
+    { "Telnet",     6 }, // Rosa salmon
+    { "RDP",        4 }, // Lila
+    { "VNC",        4 }, // Lila
+    { "HTTP",       1 }, // Azul cielo
+    { "HTTPS",      2 }, // Verde menta
+    { "HTTP-Alt",   1 }, // Azul cielo
+    { "HTTPS-Alt",  2 }, // Verde menta
+    { "SMTP",       5 }, // Durazno
+    { "SMTPS",      5 }, // Durazno
+    { "SMTP-Sub",   5 }, // Durazno
+    { "POP3",       5 }, // Durazno
+    { "POP3S",      5 }, // Durazno
+    { "IMAP",       5 }, // Durazno
+    { "IMAPS",      5 }, // Durazno
+    { "DNS",        3 }, // Amarillo
+    { "mDNS",       3 }, // Amarillo
+    { "NetBIOS-NS", 9 }, // Gris
+    { "NetBIOS-DG", 9 }, // Gris
+    { "NetBIOS-SS", 9 }, // Gris
+    { "SMB",        9 }, // Gris
+    { "FTP",        8 }, // Turquesa
+    { "FTP-Data",   8 }, // Turquesa
+    { "TFTP",       8 }, // Turquesa
+    { "FTPS",       8 }, // Turquesa
+    { "FTPS-Data",  8 }, // Turquesa
+    { "SNMP",       7 }, // Lima
+    { "SNMP-Trap",  7 }, // Lima
+    { "Syslog",     7 }, // Lima
+    { "NTP",        3 }, // Amarillo
+    { "DHCP-Srv",   3 }, // Amarillo
+    { "DHCP-Cli",   3 }, // Amarillo
+    { "DHCPv6-Cli", 3 }, // Amarillo
+    { "DHCPv6-Srv", 3 }, // Amarillo
+    { "MySQL",      6 }, // Rosa salmon
+    { "PostgreSQL", 6 }, // Rosa salmon
+    { "MSSQL",      6 }, // Rosa salmon
+    { "Oracle",     6 }, // Rosa salmon
+    { "Redis",      6 }, // Rosa salmon
+    { "MongoDB",    6 }, // Rosa salmon
+    { "SIP",        4 }, // Lila
+    { "SIPS",       4 }, // Lila
+    { "OpenVPN",    2 }, // Verde menta
+    { "IKE",        2 }, // Verde menta
+    { "IPSec-NAT",  2 }, // Verde menta
+    { "BGP",        0 }, // Lavanda
+    { "LDAP",       7 }, // Lima
+    { "LDAPS",      7 }, // Lima
+    { "Kerberos",   0 }, // Lavanda
+    { "RPC",        9 }, // Gris
+    { "NFS",        8 }, // Turquesa
+    { "BitTorrent", 6 }, // Rosa salmon
 };
 const int NUM_PROTOCOLOS_CONFIG = sizeof(g_protocolo_colores) / sizeof(ProtocoloColor);
 
-// Devuelve el color pastel asignado al protocolo o gris claro si no está en la lista
+// Devuelve el color
 ImVec4 ColorParaProtocolo(const std::string& protocolo) {
+    if (!g_color_protocolo_activo)
+        return ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
     for (int i = 0; i < NUM_PROTOCOLOS_CONFIG; ++i) {
         if (protocolo == g_protocolo_colores[i].nombre) {
             return g_paleta_colores[g_protocolo_colores[i].paleta_idx];
         }
     }
-    return ImVec4(0.88f, 0.88f, 0.88f, 1.0f); // Gris claro por defecto (protocolo no configurado)
+    return ImVec4(0.88f, 0.88f, 0.88f, 1.0f);
 }
 
 // Función auxiliar para evaluar si un paquete cumple con los filtros activos
@@ -132,6 +192,20 @@ bool CumpleFiltros(const PacketData& paquete) {
         std::string p_dst = std::to_string(paquete.dst_port);
         if (p_dst.find(filter_dst_port) == std::string::npos) return false;
     }
+    if (strlen(filter_payload) > 0) {
+        // Convertir el vector de bytes puros a un string
+        std::string payload_str(paquete.raw_bytes.begin(), paquete.raw_bytes.end());
+        std::string busqueda_str = filter_payload;
+        
+        // Convertir ambos textos a minúsculas para la búsqueda
+        std::transform(payload_str.begin(), payload_str.end(), payload_str.begin(), ::tolower);
+        std::transform(busqueda_str.begin(), busqueda_str.end(), busqueda_str.begin(), ::tolower);
+
+        // Si la palabra no se encuentra en ningún byte del paquete, ocultar
+        if (payload_str.find(busqueda_str) == std::string::npos) {
+            return false;
+        }
+    }
     
     return true;
 }
@@ -142,8 +216,6 @@ void exportar_csv() {
     lock_guard<std::mutex> lock(g_packets_mutex);
     if (g_packets.empty()) return;
 
-    // Nombre del archivo .csv
-    // Podríamos cambiarlo a que el usuario ingrese el nombre que quiera, MODIFICAR
     ofstream archivo("reporte_sniffer.csv");
     if (!archivo.is_open()) return;
 
@@ -165,16 +237,13 @@ void exportar_csv() {
         }
     }
     archivo.close();
-    
-    // Salida a terminal
-    cout << "Reporte exportado exitosamente con " << exportados << " paquetes a 'reporte_sniffer.csv'" << endl;
 }
 
 // Dibujado del área 3
 void dibujar_hexdump(const std::vector<uint8_t>& bytes) {
     // Crear subventana interna para esta área con scrollbar horizontal
     ImGui::BeginChild("HexdumpView", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
-    ImGui::SetWindowFontScale(g_zoom_nivel);    // zoom en el área 3
+    ImGui::SetWindowFontScale(g_zoom_nivel);
     
     // Agrupación en bloques de 16 Bytes
     for (size_t i = 0; i < bytes.size(); i += 16) {
@@ -195,7 +264,7 @@ void dibujar_hexdump(const std::vector<uint8_t>& bytes) {
         }
         ImGui::Text("%s", hex_stream.str().c_str());
         ImGui::SameLine();
-        ImGui::Text(" | "); // Separador
+        ImGui::Text(" | ");
         ImGui::SameLine();
 
         // Volver a iterar en los 16 Bytes para extraer su equivalencia en caracteres alfabeticos
@@ -204,14 +273,46 @@ void dibujar_hexdump(const std::vector<uint8_t>& bytes) {
             if (i + j < bytes.size()) {
                 uint8_t ch = bytes[i + j];
                 if (ch >= 32 && ch <= 126) ascii_str += (char)ch;
-                else ascii_str += "."; // Byte de control, espacio nulo o binario
+                else ascii_str += ".";
             }
         }
 
-        // Imprimir la cadena de color verde
         ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "%s", ascii_str.c_str());
     }
     ImGui::EndChild();
+}
+
+// Ejecutar la acción que el modal de confirmación tenga pendiente
+void EjecutarAccionPendiente(int& interfaz_seleccionada_idx, bool& debe_cerrar_app) {
+    switch (g_accion_pendiente) {
+        case AccionPendiente::CAMBIAR_INTERFAZ: {
+            if (g_is_capturing) DetenerCaptura();
+            std::lock_guard<std::mutex> lock(g_packets_mutex);
+            g_packets.clear();
+            g_selected_packet_idx = -1;
+            g_packet_id_counter = 1;
+            g_capture_start_time = { -1, 0 };
+            interfaz_seleccionada_idx = g_interfaz_destino_idx;
+            break;
+        }
+        case AccionPendiente::LIMPIAR: {
+            std::lock_guard<std::mutex> lock(g_packets_mutex);
+            g_packets.clear();
+            g_selected_packet_idx = -1;
+            g_packet_id_counter = 1;
+            g_capture_start_time = { -1, 0 };
+            break;
+        }
+        case AccionPendiente::SALIR:
+            debe_cerrar_app = true;
+            break;
+        default:
+            break;
+    }
+
+    g_accion_pendiente = AccionPendiente::NINGUNA;
+    g_interfaz_destino_idx = -1;
+    ImGui::CloseCurrentPopup();
 }
 
 int main(int, char**) {
@@ -239,15 +340,15 @@ int main(int, char**) {
     int interfaz_seleccionada_idx = 0;
 
     // Bucle de la ventana
-    bool g_debe_cerrar_app = false; // Controla la salida real del bucle (separado del flag nativo de GLFW)
-    while (!g_debe_cerrar_app) {
+    bool debe_cerrar_app = false; // Controla la salida real del bucle (separado del flag nativo de GLFW)
+    while (!debe_cerrar_app) {
         int ancho_ventana, alto_ventana;
 
         //Obtiene eventos de GLFW y genera un nuevo frame
         glfwPollEvents();
 
-        // Si el usuario pidió cerrar (botón X / Alt+F4), se intercepta para cancelar el cierre nativo y si hay datos
-        // sin guardar o captura activa, mostrar el modal de confirmación en su lugar
+        // Si el usuario pide cerrar (botón X / alt+F4) se intercepta y cancela el cierre nativo, si hay
+        // datos sin guardar o captura activa muetsra el modal de confirmación
         if (glfwWindowShouldClose(window)) {
             glfwSetWindowShouldClose(window, GLFW_FALSE); // Cancela el cierre automático de GLFW
             if (g_accion_pendiente == AccionPendiente::NINGUNA) {
@@ -260,7 +361,7 @@ int main(int, char**) {
                     g_accion_pendiente = AccionPendiente::SALIR;
                     g_abrir_popup_confirmacion = true;
                 } else {
-                    g_debe_cerrar_app = true; // Nada que perder, cerrar directo
+                    debe_cerrar_app = true;
                     continue;
                 }
             }
@@ -270,26 +371,26 @@ int main(int, char**) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // Establecer el tamaño y título de la ventana
         glfwGetFramebufferSize(window, &ancho_ventana, &alto_ventana);
         ImGui::SetNextWindowPos(ImVec2(0, 0));
         ImGui::SetNextWindowSize(ImVec2((float)ancho_ventana, (float)alto_ventana));
 
-        ImGui::Begin("Consola Sniffer", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
+        ImGui::Begin("Consola Sniffer", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
         // BARRA DE CONTROLES SUPERIOR
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.13f, 0.13f, 0.16f, 1.0f));
-        ImGui::BeginChild("##toolbar", ImVec2(0, 82), false, ImGuiWindowFlags_NoScrollbar);
+        float toolbar_height = g_show_dpi_search ? 120.0f : 85.0f;
+        ImGui::BeginChild("##toolbar", ImVec2(0, toolbar_height), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
         // Fila 1: Interfaz | estado | acciones
         ImGui::SetCursorPos(ImVec2(10, 10));
 
-        // Badge de estado
+        // Etiqueta de estado
         if (g_is_capturing) {
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.10f, 0.42f, 0.15f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.10f, 0.42f, 0.15f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.10f, 0.42f, 0.15f, 1.0f));
-            ImGui::Button("....", ImVec2(60, 22));
+            ImGui::Button("LIVE", ImVec2(60, 22));
             ImGui::PopStyleColor(3);
         } else {
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.25f, 0.25f, 0.28f, 1.0f));
@@ -339,7 +440,6 @@ int main(int, char**) {
 
         ImGui::SameLine(0, 14);
 
-        // Separador vertical manual
         {
             ImVec2 p = ImGui::GetCursorScreenPos();
             ImGui::GetWindowDrawList()->AddLine(
@@ -368,7 +468,6 @@ int main(int, char**) {
 
         ImGui::SameLine(0, 14);
 
-        // Separador vertical manual
         {
             ImVec2 p = ImGui::GetCursorScreenPos();
             ImGui::GetWindowDrawList()->AddLine(
@@ -378,23 +477,43 @@ int main(int, char**) {
         }
         ImGui::SameLine(0, 14);
 
-        // Contador de paquetes capturados (info en tiempo real, modificar)
+        // Controles de Zoom
         {
-            std::lock_guard<std::mutex> lk(g_packets_mutex);
-            int total = (int)g_packets.size();
-            int filtrados = 0;
-            for (auto& p : g_packets) if (CumpleFiltros(p)) filtrados++;
-            ImGui::BeginGroup();
-            ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.9f, 1.0f), "%d", total);
-            ImGui::SameLine(0, 3);
-            ImGui::TextDisabled("total");
-            if (filtrados != total) {
-                ImGui::SameLine(0, 10);
-                ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%d", filtrados);
-                ImGui::SameLine(0, 3);
-                ImGui::TextDisabled("visibles");
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
+            ImGui::TextDisabled("Zoom");
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 4);
+            ImGui::SameLine(0, 6);
+
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.26f, 0.26f, 0.30f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.34f, 0.34f, 0.40f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.20f, 0.20f, 0.24f, 1.0f));
+            if (ImGui::Button("-##zoom", ImVec2(26, 26))) {
+                g_zoom_nivel -= ZOOM_PASO;
+                if (g_zoom_nivel < ZOOM_MIN) g_zoom_nivel = ZOOM_MIN;
             }
-            ImGui::EndGroup();
+            ImGui::PopStyleColor(3);
+
+            ImGui::SameLine(0, 4);
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
+            ImGui::Text("%d%%", (int)(g_zoom_nivel * 100.0f + 0.5f));
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 4);
+            ImGui::SameLine(0, 4);
+
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.26f, 0.26f, 0.30f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.34f, 0.34f, 0.40f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.20f, 0.20f, 0.24f, 1.0f));
+            if (ImGui::Button("+##zoom", ImVec2(26, 26))) {
+                g_zoom_nivel += ZOOM_PASO;
+                if (g_zoom_nivel > ZOOM_MAX) g_zoom_nivel = ZOOM_MAX;
+            }
+            ImGui::PopStyleColor(3);
+
+            ImGui::SameLine(0, 6);
+            ImGui::PushStyleColor(ImGuiCol_Button,        g_zoom_nivel == 1.0f ? ImVec4(0.16f, 0.52f, 0.22f, 1.0f) : ImVec4(0.26f, 0.26f, 0.30f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, g_zoom_nivel == 1.0f ? ImVec4(0.20f, 0.62f, 0.26f, 1.0f) : ImVec4(0.34f, 0.34f, 0.40f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  g_zoom_nivel == 1.0f ? ImVec4(0.14f, 0.44f, 0.18f, 1.0f) : ImVec4(0.20f, 0.20f, 0.24f, 1.0f));
+            if (ImGui::Button("Restablecer##zoom", ImVec2(0, 26))) g_zoom_nivel = 1.0f;
+            ImGui::PopStyleColor(3);
         }
 
         ImGui::SameLine(0, 14);
@@ -412,7 +531,7 @@ int main(int, char**) {
         ImGui::PopStyleColor(3);
 
         if (ImGui::BeginPopup("PopupVista")) {
-            ImGui::TextDisabled("Apariencia del Registro de Trafico");
+            ImGui::TextDisabled("Apariencia del Registro de Tráfico");
             ImGui::Separator();
 
             // Botón que se resalta en verde si es la opción activa
@@ -436,34 +555,66 @@ int main(int, char**) {
                 // Pestaña 1: Opciones generales
                 if (ImGui::BeginTabItem("General")) {
                     ImGui::Spacing();
-                    ImGui::Text("Zoom global");
+                    ImGui::Text("Colores de fondo");
                     ImGui::SameLine(150);
 
-                    // Botones +, - y restablecer
-                    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.26f, 0.26f, 0.30f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.34f, 0.34f, 0.40f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.20f, 0.20f, 0.24f, 1.0f));
-                    if (ImGui::Button("-", ImVec2(26, 0))) {
-                        g_zoom_nivel -= ZOOM_PASO;
-                        if (g_zoom_nivel < ZOOM_MIN) g_zoom_nivel = ZOOM_MIN;
+                    // Botón X: desactiva colores de protocolo y fuerza letra blanca
+                    {
+                        bool sin_color = !g_color_protocolo_activo;
+                        ImGui::PushStyleColor(ImGuiCol_Button,        sin_color ? ImVec4(0.50f, 0.10f, 0.10f, 1.0f) : ImVec4(0.26f, 0.26f, 0.30f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, sin_color ? ImVec4(0.68f, 0.14f, 0.14f, 1.0f) : ImVec4(0.34f, 0.34f, 0.40f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  sin_color ? ImVec4(0.38f, 0.08f, 0.08f, 1.0f) : ImVec4(0.20f, 0.20f, 0.24f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Border, sin_color ? ImVec4(1.0f,1.0f,1.0f,1.0f) : ImVec4(0.0f,0.0f,0.0f,0.4f));
+                        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, sin_color ? 2.5f : 1.0f);
+                        if (ImGui::Button("##btn_x", ImVec2(20, 20))) {
+                            if (g_color_protocolo_activo) {
+                                g_text_color_idx_previo = g_table_text_color_idx;
+                                g_table_text_color_idx = 2;
+                            }
+                            g_color_protocolo_activo = false;
+                        }
+                        ImGui::PopStyleVar();
+                        ImGui::PopStyleColor(4);
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Sin color%s", sin_color ? " (actual)" : "");
+
+                        // Dibujar X roja encima
+                        ImVec2 p = ImGui::GetItemRectMin();
+                        ImVec2 q = ImGui::GetItemRectMax();
+                        ImDrawList* dl = ImGui::GetWindowDrawList();
+                        ImU32 x_col = IM_COL32(230, 80, 80, 240);
+                        dl->AddLine(ImVec2(p.x+4, p.y+4), ImVec2(q.x-4, q.y-4), x_col, 2.0f);
+                        dl->AddLine(ImVec2(q.x-4, p.y+4), ImVec2(p.x+4, q.y-4), x_col, 2.0f);
                     }
-                    ImGui::PopStyleColor(3);
 
-                    ImGui::SameLine();
-                    ImGui::Text("%d%%", (int)(g_zoom_nivel * 100.0f + 0.5f));
-                    ImGui::SameLine();
+                    ImGui::SameLine(0, 4);
 
-                    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.26f, 0.26f, 0.30f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.34f, 0.34f, 0.40f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.20f, 0.20f, 0.24f, 1.0f));
-                    if (ImGui::Button("+", ImVec2(26, 0))) {
-                        g_zoom_nivel += ZOOM_PASO;
-                        if (g_zoom_nivel > ZOOM_MAX) g_zoom_nivel = ZOOM_MAX;
+                    // Botón palomita: reactiva colores y restaura el color de letra previo
+                    {
+                        bool con_color = g_color_protocolo_activo;
+                        ImGui::PushStyleColor(ImGuiCol_Button,        con_color ? ImVec4(0.16f, 0.52f, 0.22f, 1.0f) : ImVec4(0.26f, 0.26f, 0.30f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, con_color ? ImVec4(0.20f, 0.62f, 0.26f, 1.0f) : ImVec4(0.34f, 0.34f, 0.40f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  con_color ? ImVec4(0.14f, 0.44f, 0.18f, 1.0f) : ImVec4(0.20f, 0.20f, 0.24f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Border, con_color ? ImVec4(1.0f,1.0f,1.0f,1.0f) : ImVec4(0.0f,0.0f,0.0f,0.4f));
+                        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, con_color ? 2.5f : 1.0f);
+                        if (ImGui::Button("##btn_check", ImVec2(20, 20))) {
+                            if (!g_color_protocolo_activo)
+                                g_table_text_color_idx = g_text_color_idx_previo;
+                            g_color_protocolo_activo = true;
+                        }
+                        ImGui::PopStyleVar();
+                        ImGui::PopStyleColor(4);
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Con color%s", con_color ? " (actual)" : "");
+
+                        // Dibujar palomita verde encima
+                        ImVec2 p = ImGui::GetItemRectMin();
+                        ImVec2 q = ImGui::GetItemRectMax();
+                        ImDrawList* dl = ImGui::GetWindowDrawList();
+                        ImU32 chk_col = IM_COL32(100, 230, 120, 240);
+                        float cx = p.x + (q.x - p.x) * 0.5f;
+                        float cy = p.y + (q.y - p.y) * 0.5f;
+                        dl->AddLine(ImVec2(p.x+3, cy),     ImVec2(cx-1,  q.y-4), chk_col, 2.0f);
+                        dl->AddLine(ImVec2(cx-1,  q.y-4),  ImVec2(q.x-3, p.y+4), chk_col, 2.0f);
                     }
-                    ImGui::PopStyleColor(3);
-
-                    ImGui::SameLine();
-                    if (OpcionBoton("Restablecer", g_zoom_nivel == 1.0f)) g_zoom_nivel = 1.0f;
 
                     ImGui::Spacing();
                     ImGui::Text("Intensidad de fondo");
@@ -505,7 +656,6 @@ int main(int, char**) {
                             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(sw.x * 0.9f, sw.y * 0.9f, sw.z * 0.9f, 1.0f));
                             ImGui::PushStyleColor(ImGuiCol_ButtonActive, sw);
 
-                            // Borde blanco grueso si es el color actualmente asignado
                             if (es_actual) {
                                 ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
                                 ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 2.5f);
@@ -538,7 +688,6 @@ int main(int, char**) {
 
         ImGui::SameLine(0, 10);
 
-        // Separador vertical manual
         {
             ImVec2 p = ImGui::GetCursorScreenPos();
             ImGui::GetWindowDrawList()->AddLine(
@@ -570,37 +719,74 @@ int main(int, char**) {
                 g_accion_pendiente = AccionPendiente::LIMPIAR;
                 g_abrir_popup_confirmacion = true;
             }
-            // Si ya está vacío, no hay nada que confirmar ni que limpiar
         }
         ImGui::PopStyleColor(3);
 
-        // Fila 2: Filtros
-        ImGui::SetCursorPos(ImVec2(10, 46));
+        // ZONA DE FILTROS (CON ACORDEÓN PARA DPI)
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Filtros de Cabecera:");
+        
+        // Fila 1: Filtros Clásicos
+        ImGui::PushItemWidth(140); 
+        ImGui::InputTextWithHint("##src_ip", "IP Origen...", filter_src_ip, IM_ARRAYSIZE(filter_src_ip));
+        ImGui::SameLine();
+        ImGui::InputTextWithHint("##dst_ip", "IP Destino...", filter_dst_ip, IM_ARRAYSIZE(filter_dst_ip));
+        ImGui::SameLine();
+        ImGui::InputTextWithHint("##src_port", "Puerto Origen...", filter_src_port, IM_ARRAYSIZE(filter_src_port));
+        ImGui::SameLine();
+        ImGui::InputTextWithHint("##dst_port", "Puerto Destino...", filter_dst_port, IM_ARRAYSIZE(filter_dst_port));
+        ImGui::SameLine();
+        ImGui::InputTextWithHint("##proto", "Protocolo (TCP)...", filter_protocol, IM_ARRAYSIZE(filter_protocol));
+        ImGui::PopItemWidth(); 
 
-        ImGui::TextDisabled("Filtrar:");
-        ImGui::SameLine(0, 10);
+        ImGui::SameLine();
+        if (ImGui::Button("Limpiar Todos")) {
+            filter_src_ip[0] = '\0';
+            filter_dst_ip[0] = '\0';
+            filter_src_port[0] = '\0';
+            filter_dst_port[0] = '\0';
+            filter_protocol[0] = '\0';
+            filter_payload[0] = '\0';
+        }
 
-        auto FiltroInput = [](const char* label, const char* hint, char* buf, int size, float width) {
-            ImGui::TextDisabled("%s", label);
-            ImGui::SameLine(0, 4);
-            ImGui::PushItemWidth(width);
-            ImGui::PushStyleColor(ImGuiCol_FrameBg,        ImVec4(0.20f, 0.20f, 0.25f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.26f, 0.26f, 0.32f, 1.0f));
-            std::string id = std::string("##f") + label;
-            ImGui::InputTextWithHint(id.c_str(), hint, buf, size);
+        // Botón Lupa
+        ImGui::SameLine();
+        
+        // Si hay texto en el filtro pero está oculto
+        bool filtro_oculto_activo = (!g_show_dpi_search && strlen(filter_payload) > 0);
+        if (filtro_oculto_activo) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.4f, 0.0f, 1.0f)); 
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.5f, 0.1f, 1.0f));
+        }
+
+        // El texto del botón cambia dependiendo de si está abierto o cerrado
+        if (ImGui::Button(g_show_dpi_search ? "[-] Cerrar DPI" : "Búsqueda Profunda")) {
+            g_show_dpi_search = !g_show_dpi_search;
+        }
+
+        if (filtro_oculto_activo) {
             ImGui::PopStyleColor(2);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.0f, 1.0f), "(!)");
+        }
+
+        // Fila 2: Búsqueda Profunda (SOLO SE DIBUJA SI EL BOTÓN ESTÁ ACTIVO)
+        if (g_show_dpi_search) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.8f, 0.4f, 1.0f, 1.0f), "Inspección de Contenido (DPI):");
+            
+            ImGui::PushItemWidth(450); 
+            ImGui::InputTextWithHint("##payload", "Buscar texto en los bytes (ej. login, password)...", filter_payload, IM_ARRAYSIZE(filter_payload));
             ImGui::PopItemWidth();
-            ImGui::SameLine(0, 12);
-        };
+            
+            ImGui::SameLine();
+            if (ImGui::Button("Borrar Texto DPI")) {
+                filter_payload[0] = '\0';
+            }
+        }
 
-        // Textos guia
-        FiltroInput("Origen",   "0.0.0.0",  filter_src_ip,   IM_ARRAYSIZE(filter_src_ip),   105);
-        FiltroInput("Destino",  "0.0.0.0",  filter_dst_ip,   IM_ARRAYSIZE(filter_dst_ip),   105);
-        FiltroInput("Pto.Src",  "80",        filter_src_port, IM_ARRAYSIZE(filter_src_port),  52);
-        FiltroInput("Pto.Dst",  "443",       filter_dst_port, IM_ARRAYSIZE(filter_dst_port),  52);
-        FiltroInput("Proto",    "TCP",       filter_protocol, IM_ARRAYSIZE(filter_protocol),  65);
+        ImGui::Separator();
 
-        // Revisar si hay filtro(s) puesto(s)
+        // Revisar si hay filtros puestos
         bool hay_filtros = filter_src_ip[0] || filter_dst_ip[0] || filter_src_port[0] || filter_dst_port[0] || filter_protocol[0];
         if (hay_filtros) {
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.45f, 0.12f, 0.12f, 1.0f));
@@ -614,7 +800,7 @@ int main(int, char**) {
         }
 
         ImGui::EndChild();
-        ImGui::PopStyleColor(); // ChildBg
+        ImGui::PopStyleColor();
 
         ImGui::Separator();
 
@@ -632,7 +818,7 @@ int main(int, char**) {
         
         // Inicialización de la altura si es el primer renderizado
         if (g_area1_height < 0) {
-            g_area1_height = alto_ventana * 0.35f;
+            g_area1_height = alto_ventana * 0.28f;
         }
 
         // Variable local para rastrear si el usuario estaba al fondo antes de procesar las filas
@@ -648,7 +834,7 @@ int main(int, char**) {
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                 ImGuiTableFlags_Reorderable |   // Permite arrastrar columnas para reordenarlas
                 ImGuiTableFlags_Resizable   |   // Permite ajustar el ancho de cada columna
-                ImGuiTableFlags_ScrollY     |   // Habilita región interna con scroll + encabezado fijo (sticky header)
+                ImGuiTableFlags_ScrollY     |   // Habilita región interna con scroll más encabezado
                 ImGuiTableFlags_SizingFixedFit,
                 ImVec2(0, ImGui::GetContentRegionAvail().y))) {
             // La tabla con ScrollY crea su propia ventana interna de scroll, que NO hereda
@@ -660,7 +846,7 @@ int main(int, char**) {
             // respeta un ancho mínimo interno de ImGui (~ItemSpacing) al redimensionar, así nunca llega a 0.
             // "Informacion" usa WidthStretch para ocupar todo el espacio sobrante hacia la derecha.
             ImGui::TableSetupColumn("No.",         ImGuiTableColumnFlags_WidthFixed   | ImGuiTableColumnFlags_NoHide, 50.0f);
-            ImGui::TableSetupColumn("Tiempo",      ImGuiTableColumnFlags_WidthFixed   | ImGuiTableColumnFlags_NoHide, 80.0f);
+            ImGui::TableSetupColumn("Tiempo",      ImGuiTableColumnFlags_WidthFixed   | ImGuiTableColumnFlags_NoHide, 110.0f); // Más ancho para el formato 1234.567890
             ImGui::TableSetupColumn("IP Origen",   ImGuiTableColumnFlags_WidthFixed   | ImGuiTableColumnFlags_NoHide, 130.0f);
             ImGui::TableSetupColumn("IP Destino",  ImGuiTableColumnFlags_WidthFixed   | ImGuiTableColumnFlags_NoHide, 130.0f);
             ImGui::TableSetupColumn("Protocolo",   ImGuiTableColumnFlags_WidthFixed   | ImGuiTableColumnFlags_NoHide, 80.0f);
@@ -677,23 +863,26 @@ int main(int, char**) {
                 estaba_al_fondo = true;
             }
 
-            // Exclusión mutua para leer los paquetes capturados de forma segura
+            // Exclusión mutua para leer los paquetes capturados
             g_packets_mutex.lock();
             for (size_t i = 0; i < g_packets.size(); ++i) {
                 const PacketData& paquete = g_packets[i];
 
                 if (!CumpleFiltros(paquete)) continue;
 
-                // Color base tomado de la configuración del usuario (paleta + asignación por protocolo)
+                // Color base tomado de la configuración del usuario
                 ImVec4 text_color = g_text_color_options[g_table_text_color_idx];
                 ImVec4 base_pastel = ColorParaProtocolo(paquete.protocol);
+                bool usar_color_fondo = g_color_protocolo_activo;
                 ImU32 bg_color = ImGui::GetColorU32(AplicarTono(base_pastel));
 
-                // Si esta fila específica es la seleccionada por el usuario, sobreescribe con el color de selección azul de ImGUI
+                // Si esta fila específica es la seleccionada por el usuario,
+                // sobreescribe con el color de selección azul de ImGUI
                 bool is_selected = (g_selected_packet_idx == (int)i);
                 if (is_selected) {
-                    bg_color = ImGui::GetColorU32(ImVec4(0.26f, 0.59f, 0.98f, 0.85f)); // Azul selección
-                    text_color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f); // Texto blanco solo en selección
+                    bg_color = ImGui::GetColorU32(ImVec4(0.26f, 0.59f, 0.98f, 0.85f));
+                    text_color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+                    usar_color_fondo = true;
                 }
 
                 ImGui::TableNextRow();
@@ -702,7 +891,8 @@ int main(int, char**) {
                 for (int col = 0; col < 7; ++col) {
                     ImGui::TableSetColumnIndex(col);
                     // Esto pinta el fondo completo de la celda de forma permanente sin importar el ratón
-                    ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, bg_color);
+                    if (usar_color_fondo)
+                        ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, bg_color);
 
                     ImGui::PushStyleColor(ImGuiCol_Text, text_color);
                     
@@ -710,7 +900,7 @@ int main(int, char**) {
                         char label[32]; sprintf(label, "%d", paquete.id);
                         // El Selectable se mantiene transparente para que no altere los colores manuales de celda
                         ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0,0,0,0));
-                        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.15f)); // Sutil brillo al pasar el mouse
+                        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.15f));
                         
                         if (ImGui::Selectable(label, is_selected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
                             g_selected_packet_idx = (int)i;
@@ -740,7 +930,7 @@ int main(int, char**) {
 
         ImGui::EndChild();
 
-        // ----- SPLITTER ENTRE ÁREA 1 y LAS ÁREAS 2 Y 3 -----
+        // SPLITTER ENTRE ÁREA 1 y LAS ÁREAS 2 Y 3
         // Cambia dinámicamente el puntero a una barra de redimensionamiento vertical al pasar el mouse
         ImGui::Button("##SplitterHorizontal", ImVec2(-1, 6.0f));
         if (ImGui::IsItemActive()) {
@@ -756,12 +946,13 @@ int main(int, char**) {
         ImGui::Separator();
 
         //Pánel inferior - Recalcula el tamaño restante de la pantalla tras el movimiento del Splitter
-        float lower_height = alto_ventana - g_area1_height - 190.0f; 
-        if (lower_height < 100.0f) lower_height = 100.0f; // Salvaguarda de espacio mínimo
+        float offset_inferior = g_show_dpi_search ? 225.0f : 195.0f;
+        float lower_height = ImGui::GetContentRegionAvail().y - 14.0f; 
+        if (lower_height < 100.0f) lower_height = 100.0f;
 
         ImGui::Columns(2, "LowerPanels", true);
 
-        // ----- Datos por capas -----
+        // Datos por capas
         ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.10f, 1.0f), "Análisis por Capas  ");
         ImGui::SameLine();
         ImGui::TextDisabled("OSI / TCP-IP");
@@ -775,12 +966,22 @@ int main(int, char**) {
             const PacketData& paquete = g_packets[g_selected_packet_idx];
 
             if (ImGui::TreeNode("Capa II: Enlace de Datos")) {
-                ImGui::Text("MAC Origen: %s", paquete.mac_src.c_str());
+                ImGui::Text("MAC Origen:  %s", paquete.mac_src.c_str());
                 ImGui::Text("MAC Destino: %s", paquete.mac_dst.c_str());
-                ImGui::Text("Type del Frame: 0x%04X", paquete.eth_type);
+                ImGui::Text("EtherType:   0x%04X  (%s)",
+                    paquete.eth_type,
+                    paquete.eth_type == 0x0800 ? "IPv4" :
+                    paquete.eth_type == 0x0806 ? "ARP"  :
+                    paquete.eth_type == 0x86DD ? "IPv6" :
+                    paquete.eth_type == 0x8100 ? "VLAN 802.1Q" :
+                    paquete.eth_type == 0x8847 ? "MPLS Unicast" :
+                    paquete.eth_type == 0x8848 ? "MPLS Multicast" :
+                    paquete.eth_type == 0x88CC ? "LLDP" : "Otro");
                 ImGui::TreePop();
             }
             if (paquete.eth_type == ETHERTYPE_IP && ImGui::TreeNode("Capa III: Red con IPv4")) {
+                ImGui::Text("Version: IPv%d", paquete.ip_version);
+                ImGui::Text("Longitud total: %d bytes", paquete.ip_len);
                 ImGui::Text("IP Origen: %s", paquete.source_ip.c_str());
                 ImGui::Text("IP Destino: %s", paquete.dest_ip.c_str());
                 ImGui::Text("TTL (Tiempo de vida): %d", paquete.ip_ttl);
@@ -824,13 +1025,101 @@ int main(int, char**) {
                 ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.7f, 1.0f), "  -> %s", proto_desc);
                 ImGui::TreePop();
             }
-            // Capa de Transporte (TCP / UDP / SCTP)
-            string trans_lbl = "Capa IV: Transporte " + paquete.protocol;
-            if ((paquete.protocol == "TCP" || paquete.protocol == "UDP" || paquete.protocol == "SCTP")
+
+            // Capa de Transporte (TCP / UDP / SCTP / app detectada por puerto)
+            bool es_app = !paquete.app_protocol.empty();
+            // Para protocolos de aplicación, la capa IV muestra TCP/UDP según ip_proto
+            std::string trans_proto = (es_app && paquete.ip_proto == 6) ? "TCP" :
+                                      (es_app && paquete.ip_proto == 17) ? "UDP" :
+                                      paquete.protocol;
+            string trans_lbl = "Capa IV: Transporte " + trans_proto;
+
+            if ((paquete.protocol == "TCP" || paquete.protocol == "UDP" || paquete.protocol == "SCTP" || es_app)
                 && ImGui::TreeNode(trans_lbl.c_str())) {
-                ImGui::Text("Puerto Origen: %d", paquete.src_port);
+                ImGui::Text("Puerto Origen:  %d", paquete.src_port);
                 ImGui::Text("Puerto Destino: %d", paquete.dst_port);
+                if (paquete.protocol == "TCP") {
+                    ImGui::Text("Flags TCP:");
+                    ImGui::SameLine();
+                    auto Flag = [&](const char* name, uint8_t bit, ImVec4 col) {
+                        if (paquete.tcp_flags & bit)
+                            ImGui::TextColored(col, "[%s]", name);
+                        else
+                            ImGui::TextDisabled("[%s]", name);
+                        ImGui::SameLine(0, 4);
+                    };
+                    Flag("SYN", 0x02, ImVec4(0.4f, 1.0f, 0.4f, 1.0f));
+                    Flag("ACK", 0x10, ImVec4(0.4f, 0.8f, 1.0f, 1.0f));
+                    Flag("FIN", 0x01, ImVec4(1.0f, 0.8f, 0.3f, 1.0f));
+                    Flag("RST", 0x04, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
+                    Flag("PSH", 0x08, ImVec4(0.9f, 0.6f, 1.0f, 1.0f));
+                    Flag("URG", 0x20, ImVec4(1.0f, 0.6f, 0.2f, 1.0f));
+                    ImGui::NewLine();
+                }
+                if (!paquete.app_protocol.empty())
+                    ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "Protocolo de aplicacion detectado: %s", paquete.app_protocol.c_str());
                 ImGui::TreePop();
+            }
+            if (es_app) {
+                std::string app_lbl = "Capa VII: " + paquete.app_protocol + " (Aplicacion)";
+                if (ImGui::TreeNode(app_lbl.c_str())) {
+                    ImGui::Text("IP Origen:  %s : %d", paquete.source_ip.c_str(), paquete.src_port);
+                    ImGui::Text("IP Destino: %s : %d", paquete.dest_ip.c_str(),   paquete.dst_port);
+                    // Notas específicas por protocolo
+                    if (paquete.app_protocol == "SSH")
+                        ImGui::TextColored(ImVec4(0.7f,0.6f,1.0f,1.0f), "Acceso remoto cifrado. El payload no es legible.");
+                    else if (paquete.app_protocol == "Telnet")
+                        ImGui::TextColored(ImVec4(1.0f,0.5f,0.5f,1.0f), "Acceso remoto SIN cifrado. El payload es texto legible.");
+                    else if (paquete.app_protocol == "RDP")
+                        ImGui::TextColored(ImVec4(0.7f,0.5f,1.0f,1.0f), "Escritorio remoto Windows (cifrado).");
+                    else if (paquete.app_protocol == "VNC")
+                        ImGui::TextColored(ImVec4(0.7f,0.5f,1.0f,1.0f), "Control remoto de escritorio.");
+                    else if (paquete.app_protocol == "HTTP")
+                        ImGui::TextColored(ImVec4(0.5f,0.8f,1.0f,1.0f), "Trafico web sin cifrar. Payload legible en hexdump.");
+                    else if (paquete.app_protocol == "HTTPS" || paquete.app_protocol == "HTTPS-Alt")
+                        ImGui::TextColored(ImVec4(0.5f,1.0f,0.6f,1.0f), "Trafico web cifrado con TLS/SSL.");
+                    else if (paquete.app_protocol == "HTTP-Alt")
+                        ImGui::TextColored(ImVec4(0.5f,0.8f,1.0f,1.0f), "HTTP en puerto alternativo.");
+                    else if (paquete.app_protocol == "DNS" || paquete.app_protocol == "mDNS")
+                        ImGui::TextColored(ImVec4(1.0f,0.95f,0.4f,1.0f), "Resolucion de nombres de dominio.");
+                    else if (paquete.app_protocol == "SMTP" || paquete.app_protocol == "SMTPS" || paquete.app_protocol == "SMTP-Sub")
+                        ImGui::TextColored(ImVec4(1.0f,0.7f,0.3f,1.0f), "Envio de correo electronico.");
+                    else if (paquete.app_protocol == "POP3" || paquete.app_protocol == "POP3S")
+                        ImGui::TextColored(ImVec4(1.0f,0.7f,0.3f,1.0f), "Recepcion de correo (POP3).");
+                    else if (paquete.app_protocol == "IMAP" || paquete.app_protocol == "IMAPS")
+                        ImGui::TextColored(ImVec4(1.0f,0.7f,0.3f,1.0f), "Acceso a correo en servidor (IMAP).");
+                    else if (paquete.app_protocol == "FTP" || paquete.app_protocol == "FTP-Data" || paquete.app_protocol == "FTPS" || paquete.app_protocol == "FTPS-Data" || paquete.app_protocol == "TFTP")
+                        ImGui::TextColored(ImVec4(0.3f,1.0f,0.9f,1.0f), "Transferencia de archivos.");
+                    else if (paquete.app_protocol == "DHCP-Srv" || paquete.app_protocol == "DHCP-Cli" || paquete.app_protocol == "DHCPv6-Cli" || paquete.app_protocol == "DHCPv6-Srv")
+                        ImGui::TextColored(ImVec4(1.0f,0.95f,0.4f,1.0f), "Asignacion dinamica de direcciones IP.");
+                    else if (paquete.app_protocol == "NTP")
+                        ImGui::TextColored(ImVec4(1.0f,0.95f,0.4f,1.0f), "Sincronizacion de tiempo de red.");
+                    else if (paquete.app_protocol == "SNMP" || paquete.app_protocol == "SNMP-Trap")
+                        ImGui::TextColored(ImVec4(0.7f,1.0f,0.5f,1.0f), "Gestion y monitoreo de dispositivos de red.");
+                    else if (paquete.app_protocol == "Syslog")
+                        ImGui::TextColored(ImVec4(0.7f,1.0f,0.5f,1.0f), "Registro de eventos del sistema.");
+                    else if (paquete.app_protocol == "SMB" || paquete.app_protocol == "NetBIOS-NS" || paquete.app_protocol == "NetBIOS-DG" || paquete.app_protocol == "NetBIOS-SS")
+                        ImGui::TextColored(ImVec4(0.8f,0.8f,0.8f,1.0f), "Comparticion de archivos e impresoras en red Windows.");
+                    else if (paquete.app_protocol == "MySQL" || paquete.app_protocol == "PostgreSQL" || paquete.app_protocol == "MSSQL" || paquete.app_protocol == "Oracle" || paquete.app_protocol == "Redis" || paquete.app_protocol == "MongoDB")
+                        ImGui::TextColored(ImVec4(1.0f,0.5f,0.5f,1.0f), "Trafico de base de datos.");
+                    else if (paquete.app_protocol == "SIP" || paquete.app_protocol == "SIPS")
+                        ImGui::TextColored(ImVec4(0.7f,0.5f,1.0f,1.0f), "Protocolo de inicio de sesion VoIP.");
+                    else if (paquete.app_protocol == "OpenVPN" || paquete.app_protocol == "IKE" || paquete.app_protocol == "IPSec-NAT")
+                        ImGui::TextColored(ImVec4(0.5f,1.0f,0.6f,1.0f), "Trafico VPN cifrado.");
+                    else if (paquete.app_protocol == "BGP")
+                        ImGui::TextColored(ImVec4(0.7f,0.6f,1.0f,1.0f), "Protocolo de enrutamiento entre sistemas autonomos.");
+                    else if (paquete.app_protocol == "LDAP" || paquete.app_protocol == "LDAPS")
+                        ImGui::TextColored(ImVec4(0.7f,1.0f,0.5f,1.0f), "Servicio de directorio (Active Directory, OpenLDAP).");
+                    else if (paquete.app_protocol == "Kerberos")
+                        ImGui::TextColored(ImVec4(0.7f,0.6f,1.0f,1.0f), "Autenticacion de red Kerberos.");
+                    else if (paquete.app_protocol == "NFS")
+                        ImGui::TextColored(ImVec4(0.3f,1.0f,0.9f,1.0f), "Sistema de archivos de red (Network File System).");
+                    else if (paquete.app_protocol == "RPC")
+                        ImGui::TextColored(ImVec4(0.8f,0.8f,0.8f,1.0f), "Llamada a procedimiento remoto.");
+                    else if (paquete.app_protocol == "BitTorrent")
+                        ImGui::TextColored(ImVec4(1.0f,0.5f,0.5f,1.0f), "Transferencia P2P BitTorrent.");
+                    ImGui::TreePop();
+                }
             }
             // Información extra para protocolos de red/enrutamiento
             if (paquete.protocol == "ICMP" && ImGui::TreeNode("Capa III: ICMP")) {
@@ -901,14 +1190,14 @@ int main(int, char**) {
 
         ImGui::NextColumn();
 
-        // ----- Datos Hexadecimales -----
+        // Datos Hexadecimales
         ImGui::TextColored(ImVec4(0.85f, 0.45f, 1.0f, 1.0f), "Volcado de Bytes");
         ImGui::SameLine();
         ImGui::TextDisabled("(hex / ASCII)");
         ImGui::BeginChild("HexPanel", ImVec2(0, lower_height), true, ImGuiWindowFlags_HorizontalScrollbar);
         ImGui::SetWindowFontScale(g_zoom_nivel);
         
-        //Otra exclusión mutua, no vaya a ser
+        // Otra exclusión mutua
         g_packets_mutex.lock();
         if (g_selected_packet_idx != -1 && g_selected_packet_idx < (int)g_packets.size()) {
             dibujar_hexdump(g_packets[g_selected_packet_idx].raw_bytes);
@@ -916,20 +1205,38 @@ int main(int, char**) {
             ImGui::Text("Selecciona un paquete para ver su contenido en hexadecimal");
         }
         g_packets_mutex.unlock();
-        //Fin
+        // Fin
         
         ImGui::EndChild();
         ImGui::Columns(1);
 
-        // --- Popup modal de confirmación (Cambiar interfaz / Limpiar / Salir) ---
+        // Popup modal de confirmación (Cambiar interfaz / Limpiar / Salir)
         if (g_abrir_popup_confirmacion) {
             ImGui::OpenPopup("##ModalConfirmacion");
             g_abrir_popup_confirmacion = false;
         }
 
+        // Los textos de los botones dependen de la acción pendiente; se resuelven aquí,
+        // ANTES de fijar el tamaño del modal, para poder medir su ancho real con la fuente actual
+        // y que el modal nunca quede más angosto que el contenido
+        const char* texto_guardar_modal = (g_accion_pendiente == AccionPendiente::LIMPIAR) ? "Guardar y limpiar" : "Guardar y continuar";
+        const char* texto_sin_guardar_modal = "Sin guardar";
+        if (g_accion_pendiente == AccionPendiente::CAMBIAR_INTERFAZ) texto_sin_guardar_modal = "Cambiar sin guardar";
+        else if (g_accion_pendiente == AccionPendiente::LIMPIAR)     texto_sin_guardar_modal = "Limpiar sin guardar";
+        else if (g_accion_pendiente == AccionPendiente::SALIR)       texto_sin_guardar_modal = "Salir sin guardar";
+
+        const float padding_boton_modal = 28.0f;
+        float ancho_boton_modal = ImGui::CalcTextSize("Cancelar").x;
+        ancho_boton_modal = std::max(ancho_boton_modal, ImGui::CalcTextSize(texto_guardar_modal).x);
+        ancho_boton_modal = std::max(ancho_boton_modal, ImGui::CalcTextSize(texto_sin_guardar_modal).x);
+        ancho_boton_modal += padding_boton_modal;
+
+        // Ancho total: 3 botones + 2 separaciones entre ellos + márgenes internos del modal (~32px)
+        float ancho_modal = std::max(460.0f, ancho_boton_modal * 3.0f + ImGui::GetStyle().ItemSpacing.x * 2.0f + 32.0f);
+
         // Centrar el modal en la pantalla
         ImGui::SetNextWindowPos(ImVec2(ancho_ventana * 0.5f, alto_ventana * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-        ImGui::SetNextWindowSize(ImVec2(460, 0));
+        ImGui::SetNextWindowSize(ImVec2(ancho_modal, 0));
 
         if (ImGui::BeginPopupModal("##ModalConfirmacion", nullptr,
                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
@@ -941,26 +1248,26 @@ int main(int, char**) {
                 total_paquetes = (int)g_packets.size();
             }
 
-            // --- Encabezado e ícono según el tipo de acción ---
+            // Encabezado e ícono según el tipo de acción
             const char* titulo = "";
             std::string mensaje;
             switch (g_accion_pendiente) {
                 case AccionPendiente::CAMBIAR_INTERFAZ:
                     titulo = "Cambiar interfaz de red";
-                    mensaje = "Tienes " + std::to_string(total_paquetes) + " paquete(s) capturado(s) en el Area 1.\n"
-                               "Cambiar de interfaz detendra la captura actual y, si continuas,\n"
-                               "se perdera el registro actual a menos que lo exportes primero.";
+                    mensaje = "Tienes " + std::to_string(total_paquetes) + " paquete(s) capturado(s).\n"
+                               "Cambiar de interfaz detendrá la captura actual y, si continuas,\n"
+                               "se perderá el registro actual a menos que lo guardes primero.";
                     break;
                 case AccionPendiente::LIMPIAR:
-                    titulo = "Limpiar registro de trafico";
-                    mensaje = "Estas a punto de borrar " + std::to_string(total_paquetes) + " paquete(s)\n"
-                               "del Area 1. Esta accion no se puede deshacer.";
+                    titulo = "Limpiar registro de tráfico";
+                    mensaje = "Estás a punto de borrar " + std::to_string(total_paquetes) + " paquete(s).\n"
+                               "Esta acción no se puede deshacer.";
                     break;
                 case AccionPendiente::SALIR:
                     titulo = "Salir del Packet Sniffeador";
-                    mensaje = "Tienes " + std::to_string(total_paquetes) + " paquete(s) capturado(s) sin exportar"
+                    mensaje = "Tienes " + std::to_string(total_paquetes) + " paquete(s) capturado(s) sin guardar"
                                + std::string(g_is_capturing ? " y una captura en curso.\n" : ".\n")
-                               + "Si sales ahora, esta informacion se perdera.";
+                               + "Si sales ahora, esta información se perderá.";
                     break;
                 default: break;
             }
@@ -972,13 +1279,11 @@ int main(int, char**) {
             ImGui::Spacing();
             ImGui::Spacing();
 
-            float ancho_boton = 132.0f;
-
-            // Botón Cancelar (siempre disponible, no hace nada)
+            // Botón Cancelar
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.30f, 0.30f, 0.34f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.40f, 0.40f, 0.46f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.22f, 0.22f, 0.26f, 1.0f));
-            if (ImGui::Button("Cancelar", ImVec2(ancho_boton, 30))) {
+            if (ImGui::Button("Cancelar", ImVec2(ancho_boton_modal, 30))) {
                 g_accion_pendiente = AccionPendiente::NINGUNA;
                 g_interfaz_destino_idx = -1;
                 ImGui::CloseCurrentPopup();
@@ -987,35 +1292,13 @@ int main(int, char**) {
 
             ImGui::SameLine();
 
-            // Botón Guardar (exporta a CSV y luego ejecuta la acción)
+            // Botón Guardar
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.18f, 0.32f, 0.58f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.42f, 0.75f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.13f, 0.24f, 0.44f, 1.0f));
-            const char* texto_guardar = (g_accion_pendiente == AccionPendiente::LIMPIAR) ? "Guardar y limpiar" : "Guardar y continuar";
-            if (ImGui::Button(texto_guardar, ImVec2(ancho_boton, 30))) {
+            if (ImGui::Button(texto_guardar_modal, ImVec2(ancho_boton_modal, 30))) {
                 exportar_csv();
-
-                if (g_accion_pendiente == AccionPendiente::CAMBIAR_INTERFAZ) {
-                    if (g_is_capturing) DetenerCaptura();
-                    std::lock_guard<std::mutex> lock(g_packets_mutex);
-                    g_packets.clear();
-                    g_selected_packet_idx = -1;
-                    g_packet_id_counter = 1;
-                    interfaz_seleccionada_idx = g_interfaz_destino_idx;
-                }
-                else if (g_accion_pendiente == AccionPendiente::LIMPIAR) {
-                    std::lock_guard<std::mutex> lock(g_packets_mutex);
-                    g_packets.clear();
-                    g_selected_packet_idx = -1;
-                    g_packet_id_counter = 1;
-                }
-                else if (g_accion_pendiente == AccionPendiente::SALIR) {
-                    g_debe_cerrar_app = true;
-                }
-
-                g_accion_pendiente = AccionPendiente::NINGUNA;
-                g_interfaz_destino_idx = -1;
-                ImGui::CloseCurrentPopup();
+                EjecutarAccionPendiente(interfaz_seleccionada_idx, debe_cerrar_app);
             }
             ImGui::PopStyleColor(3);
 
@@ -1025,33 +1308,8 @@ int main(int, char**) {
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.84f, 0.18f, 0.18f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.50f, 0.10f, 0.10f, 1.0f));
 
-            const char* texto_sin_guardar = "Sin guardar";
-            if (g_accion_pendiente == AccionPendiente::CAMBIAR_INTERFAZ) texto_sin_guardar = "Cambiar sin guardar";
-            else if (g_accion_pendiente == AccionPendiente::LIMPIAR)     texto_sin_guardar = "Limpiar sin guardar";
-            else if (g_accion_pendiente == AccionPendiente::SALIR)       texto_sin_guardar = "Salir sin guardar";
-
-            if (ImGui::Button(texto_sin_guardar, ImVec2(ancho_boton, 30))) {
-                if (g_accion_pendiente == AccionPendiente::CAMBIAR_INTERFAZ) {
-                    if (g_is_capturing) DetenerCaptura();
-                    std::lock_guard<std::mutex> lock(g_packets_mutex);
-                    g_packets.clear();
-                    g_selected_packet_idx = -1;
-                    g_packet_id_counter = 1;
-                    interfaz_seleccionada_idx = g_interfaz_destino_idx;
-                }
-                else if (g_accion_pendiente == AccionPendiente::LIMPIAR) {
-                    std::lock_guard<std::mutex> lock(g_packets_mutex);
-                    g_packets.clear();
-                    g_selected_packet_idx = -1;
-                    g_packet_id_counter = 1;
-                }
-                else if (g_accion_pendiente == AccionPendiente::SALIR) {
-                    g_debe_cerrar_app = true;
-                }
-
-                g_accion_pendiente = AccionPendiente::NINGUNA;
-                g_interfaz_destino_idx = -1;
-                ImGui::CloseCurrentPopup();
+            if (ImGui::Button(texto_sin_guardar_modal, ImVec2(ancho_boton_modal, 30))) {
+                EjecutarAccionPendiente(interfaz_seleccionada_idx, debe_cerrar_app);
             }
             ImGui::PopStyleColor(3);
 
